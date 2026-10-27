@@ -1,0 +1,4 @@
+interface:
+  display_name: "视频内容类目归类"
+  short_description: "对视频元信息执行完整路径叶子匹配、分层投票与类目占比统计"
+  default_prompt: "使用 $video-taxonomy，根据指定元信息和类目配置进行候选归类，并核验父子关系和统计口径。"

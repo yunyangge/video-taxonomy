@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+models/
+data/
+runs/
+*.sqlite*
+.env
+.DS_Store
+
+# Private taxonomy data must never be committed.
+/src/video_taxonomy/config/
+/config/
+/private/
+/local/
+**/视频类目体系*.md
+**/current.json
