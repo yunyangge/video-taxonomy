@@ -1,4 +1,4 @@
 interface:
   display_name: "视频内容类目归类"
-  short_description: "按第三种方案执行全层级路径匹配、视频投票与类目占比统计"
-  default_prompt: "使用 $video-taxonomy，根据指定元信息和类目配置进行候选归类，并核验父子关系和统计口径。"
+  short_description: "运行第三种方案全流程：配置校验、特征编码、视频分类与占比汇总"
+  default_prompt: "使用 $video-taxonomy，读取外部类目、模型或兼容缓存及视频标签，完成配置校验、特征编码、逐视频分类与一级占比汇总，并记录耗时和核验结果。"
