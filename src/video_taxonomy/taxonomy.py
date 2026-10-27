@@ -96,6 +96,28 @@ def compile_markdown(path):
 
 
 def validate(config, allow_legacy=False):
+    def require_fields(value, names, location):
+        if not isinstance(value, dict):
+            raise ValueError(f'{location} must be an object')
+        missing = [name for name in names if name not in value]
+        if missing:
+            raise ValueError(f'{location} missing required fields: {", ".join(missing)}')
+
+    require_fields(config, ['fingerprint', 'taxonomy_version', 'schema_version', 'matching_mode',
+                            'primary', 'production_forms', 'production_form_priority',
+                            'embedding', 'unknown_id'], 'Configuration')
+    require_fields(config['embedding'], ['model_name', 'dimensions', 'pooling', 'max_length',
+                                         'normalization'], 'embedding')
+    if config['unknown_id'] != 'unclassified':
+        raise ValueError('unknown_id must be unclassified')
+    for p in config['primary']:
+        require_fields(p, ['id', 'name', 'quota', 'secondaries'], 'Primary category')
+        for s in p['secondaries']:
+            require_fields(s, ['id', 'name', 'quota', 'restricted', 'children'], 'Secondary category')
+            for c in s['children']:
+                require_fields(c, ['id', 'name'], 'Tertiary category')
+    for f in config['production_forms']:
+        require_fields(f, ['id', 'name', 'quota'], 'Production form')
     unhashed = {k: v for k, v in config.items() if k != 'fingerprint'}
     if config['fingerprint'] != digest(unhashed):
         raise ValueError('Taxonomy fingerprint mismatch')

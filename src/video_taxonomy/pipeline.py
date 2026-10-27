@@ -486,6 +486,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=os.environ.get('VIDEO_TAXONOMY_CONFIG'), help='External taxonomy JSON; no taxonomy data is bundled')
     sub = parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('validate-config', help='Check external configuration and center counts without loading a model')
     p = sub.add_parser('migrate-config', help='Migrate an external leaf-only config to scheme 3')
     p.add_argument('--input', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
@@ -524,6 +525,14 @@ def main():
         return
     if not args.config:
         parser.error('Provide --config or VIDEO_TAXONOMY_CONFIG; no taxonomy data is bundled')
+    if args.command == 'validate-config':
+        config = load(args.config)
+        rows = centers(config)
+        print(json.dumps({'valid': True, 'matching_mode': config['matching_mode'],
+                          'centers': len(rows), 'dimensions': config['embedding']['dimensions'],
+                          'centers_by_level': {str(level): sum(r['level'] == level for r in rows)
+                                               for level in (1, 2, 3)}}, ensure_ascii=False))
+        return
     if getattr(args, 'batch_size', 1) < 1:
         parser.error('--batch-size must be positive')
     if getattr(args, 'lookup_only', False) and not args.tag_lookup:

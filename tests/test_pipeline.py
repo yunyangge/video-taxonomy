@@ -1,6 +1,7 @@
 """Contract and end-to-end tests. Synthetic vectors; no model or video download."""
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,23 @@ class Contracts(unittest.TestCase):
         self.assertEqual(rows[1]['path'], ['Example group A', 'Example S1'])
         self.assertEqual(rows[3]['path'], ['Example group A', 'Example S2', 'Example leaf 0'])
         self.assertTrue(all(s['id'] in {x['id'] for x in rows} for s in self.secondary.values()))
+
+    def test_agent_configuration_preflight(self):
+        result = subprocess.run([sys.executable, '-m', 'video_taxonomy', '--config',
+                                 str(self.config_path), 'validate-config'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {'valid': True, 'matching_mode': 'all_paths',
+                         'centers': 264, 'dimensions': 1024,
+                         'centers_by_level': {'1': 2, '2': 3, '3': 259}})
+        broken = json.loads(json.dumps(self.config))
+        del broken['taxonomy_version']
+        with self.assertRaisesRegex(ValueError, 'taxonomy_version'):
+            validate(broken)
+        missing = subprocess.run([sys.executable, '-m', 'video_taxonomy', 'validate-config'],
+                                 capture_output=True, text=True, env={k: v for k, v in os.environ.items()
+                                                                     if k != 'VIDEO_TAXONOMY_CONFIG'})
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn('Provide --config', missing.stderr)
 
     def test_legacy_config_migration_and_cache_invalidation(self):
         old = json.loads(json.dumps(self.config))

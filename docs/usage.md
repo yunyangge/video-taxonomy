@@ -6,6 +6,16 @@
 
 配置使用 `schema_version=2`、`matching_mode=all_paths`；包括 `primary`、`production_forms`、`production_form_priority`、`embedding`、`unknown_id` 与 `fingerprint`。每个一级节点包含 `secondaries`；二级节点包含 `children`（可以为空）、`quota`、`restricted` 与 `restriction`。各级 ID 唯一，同一父节点下名称唯一。`fingerprint` 为移除该字段后，按键排序、紧凑 JSON 编码的 SHA-256。
 
+顶层还必须提供 `taxonomy_version`。`unknown_id` 固定为 `unclassified`。一级和制作形态也需要 `quota`（不设配额可为 `{}`）；`production_forms` 和 `production_form_priority` 可以同时为空列表。`embedding` 必须提供 `model_name`、`dimensions`、`pooling`、`max_length` 和 `normalization`，配置值应与下述编码规则一致。
+
+agent 执行前必须先找到这些输入：外部配置、视频元数据、本地模型权重或兼容的向量及查询表。不要把文档里的路径占位符当成真实文件。先运行不加载模型的预检查：
+
+```bash
+video-taxonomy --config /outside/all-paths.json validate-config
+```
+
+成功时返回中心总数、各级数量及维度；配置缺字段、指纹不符或仍采用旧策略会报错。合成测试可以验证安装和流程，真实语义匹配还需要调用方的模型及数据。
+
 `tests/fixtures.py` 提供程序生成的虚构结构，仅用于理解接口和运行测试。实际类目和约束由调用方保管。
 
 旧 `matching_mode=leaf_only` 配置通过以下命令迁移；原文件不改动，指纹重新计算：

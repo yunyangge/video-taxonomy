@@ -26,6 +26,8 @@ python -m pip install -e '.[model]'
 
 ## 使用
 
+先准备仓库外的类目配置、视频标签元数据和本地模型权重（或已生成的兼容中心向量及查询表）。本仓库不下载模型、不自带实际类目，也不把合成测试当成真实视频准确率评估。
+
 外部配置使用 `schema_version=2`、`matching_mode=all_paths`。已有叶子匹配配置需要先迁移；此命令保留类目定义，只更新匹配策略和指纹，不覆盖原文件：
 
 ```bash
@@ -35,6 +37,7 @@ video-taxonomy migrate-config --input /path/outside/repo/old-categories.json --o
 随后使用**新运行目录**重新生成中心与查询表，不能复用旧方案的分类结果：
 
 ```bash
+video-taxonomy --config /path/outside/repo/categories-all-paths.json validate-config
 video-taxonomy --config /path/outside/repo/categories-all-paths.json embed-centers --run-dir /path/outside/repo/runs/scheme3 --model /path/to/Qwen3-Embedding-0.6B
 video-taxonomy --config /path/outside/repo/categories-all-paths.json classify --run-dir /path/outside/repo/runs/scheme3 --model /path/to/Qwen3-Embedding-0.6B --input /path/to/videos.jsonl --platform example --output /path/outside/repo/runs/scheme3/classified.jsonl
 video-taxonomy --config /path/outside/repo/categories-all-paths.json aggregate --input /path/outside/repo/runs/scheme3/classified.jsonl --output /path/outside/repo/runs/scheme3/distribution.json
