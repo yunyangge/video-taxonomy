@@ -9,8 +9,8 @@ from collections import Counter
 from pathlib import Path
 
 os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
-from .taxonomy import ROOT, centers, digest, load
-from .core import UNKNOWN, choose_leaf, clean, duration_seconds, eligibility, evidence, form_result, video_key
+from .taxonomy import centers, digest, load, migrate_config
+from .core import UNKNOWN, choose_path, clean, duration_seconds, eligibility, evidence, form_result, video_key
 
 
 def atomic_json(path, value):
@@ -29,7 +29,8 @@ def run_config(args, create=False):
     requested = getattr(args, 'path_separator', None)
     separator = {'slash': ' / ', 'space': ' '}.get(requested, stored.get('path_separator', ' / ') if stored else ' / ')
     spec = {'taxonomy_fingerprint': config['fingerprint'],
-            'embedding': config['embedding'], 'centers': centers(config, separator)}
+            'embedding': config['embedding'], 'centers': centers(config, separator),
+            'matching_mode': 'all_paths', 'voting_policy': 'l1_then_branch_with_direct_endpoints'}
     if separator != ' / ':
         spec['path_separator'] = separator
     args.run_dir.mkdir(parents=True, exist_ok=True)
@@ -91,7 +92,7 @@ class Matcher:
         valid = np.isfinite(x).all(axis=1) & (np.linalg.norm(x, axis=1) > 0)
         x = np.nan_to_num(x)
         x /= np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
-        similarity = x @ self.matrix.T
+        similarity = np.clip(x @ self.matrix.T, -1.0, 1.0)
         scores = similarity
         best = scores.argmax(axis=1)
         top = scores[np.arange(len(scores)), best]
@@ -164,7 +165,7 @@ def assign_tags(args):
             dest[start:start + 1000000] = arr[order[start:start + 1000000]]
         dest.flush()
     atomic_json(folder / 'metadata.json', {'taxonomy_fingerprint': config['fingerprint'],
-                'run_fingerprint': digest(spec), 'rows': count, 'leaf_ids': matcher.ids,
+                'run_fingerprint': digest(spec), 'rows': count, 'center_ids': matcher.ids,
                 'min_score': args.min_score, 'min_margin': args.min_margin,
                 'source': args.tag_source.name,
                 'source_bytes': args.tag_source.stat().st_size,
@@ -184,9 +185,9 @@ class TagLookup:
         self.arrays = {name: np.load(path / f'{name}.npy', mmap_mode='r') for name in ['h1', 'h2', 'labels', 'scores', 'margins']}
         if any(len(x) != metadata['rows'] for x in self.arrays.values()):
             raise ValueError('Incomplete tag lookup')
-        self.ids = metadata['leaf_ids']
+        self.ids = metadata['center_ids']
         if self.ids != [leaf['id'] for leaf in spec['centers']]:
-            raise ValueError('Tag lookup leaf order mismatch')
+            raise ValueError('Tag lookup center order mismatch')
 
     def get(self, text):
         np, a = self.np, self.arrays
@@ -237,7 +238,8 @@ def classify(args):
     lookup = TagLookup(args.tag_lookup, args, config, spec) if args.tag_lookup else None
     secondary = {s['id']: s for p in config['primary'] for s in p['secondaries']}
     parents = {s['id']: p['id'] for p in config['primary'] for s in p['secondaries']}
-    leaves = {leaf['id']: leaf for leaf in spec['centers']}
+    nodes = {node['id']: node for node in spec['centers']}
+    leaves = {nid: node for nid, node in nodes.items() if node['is_leaf']}
     encoder = None
     if args.output.exists():
         raise FileExistsError('Classification output already exists')
@@ -263,7 +265,7 @@ def classify(args):
                             continue
                     else:
                         stats['rows_without_identity'] += 1
-                    unique.append((platform, key, row, evidence(row)))
+                    unique.append((platform, key, row, evidence(row, args.evidence_source)))
                 texts = list(dict.fromkeys(t for _, _, _, ev in unique for t in ev))
                 predictions = {}
                 unresolved = []
@@ -287,14 +289,14 @@ def classify(args):
                                 predictions[text] = (matcher.ids[label - 1] if label else UNKNOWN, float(score), float(margin))
                 for platform, key, row, ev in unique:
                     votes = [(predictions[t][0], predictions[t][1]) for t in ev]
-                    pid, sid, lid = choose_leaf(votes, spec['centers'])
-                    status = 'metadata_candidate' if sid != UNKNOWN else 'insufficient_evidence'
+                    pid, sid, nid = choose_path(votes, spec['centers'])
+                    status = 'metadata_candidate' if pid != UNKNOWN else 'insufficient_evidence'
                     override = row.get('content_secondary_id')
                     if override is not None:
                         if override != UNKNOWN and override not in secondary:
                             raise ValueError(f'Invalid content_secondary_id: {override}')
                         sid, pid = override, parents.get(override, UNKNOWN)
-                        lid = sid if sid in leaves else UNKNOWN
+                        nid = sid
                         status = 'provided'
                     leaf_override = row.get('content_leaf_id')
                     if leaf_override is not None:
@@ -303,32 +305,48 @@ def classify(args):
                         leaf = leaves.get(leaf_override)
                         if override is not None and override != (leaf['secondary_id'] if leaf else UNKNOWN):
                             raise ValueError('Supplied leaf and secondary disagree')
-                        lid = leaf_override
+                        nid = leaf_override
                         pid, sid = (leaf['primary_id'], leaf['secondary_id']) if leaf else (UNKNOWN, UNKNOWN)
                         status = 'provided'
+                    node_override = row.get('content_node_id')
+                    if node_override is not None:
+                        if node_override != UNKNOWN and node_override not in nodes:
+                            raise ValueError(f'Invalid content_node_id: {node_override}')
+                        node = nodes.get(node_override)
+                        node_sid = (node['secondary_id'] or UNKNOWN) if node else UNKNOWN
+                        if override is not None and override != node_sid:
+                            raise ValueError('Supplied node and secondary disagree')
+                        if leaf_override is not None and leaf_override != (node_override if node_override in leaves else UNKNOWN):
+                            raise ValueError('Supplied node and leaf disagree')
+                        nid, sid = node_override, node_sid
+                        pid = node['primary_id'] if node else UNKNOWN
+                        status = 'provided'
+                    lid = nid if nid in leaves else UNKNOWN
                     form, form_status, form_candidates = form_result(row, config)
                     duration, duration_kind = duration_seconds(row)
                     result = {'taxonomy_version': config['taxonomy_version'], 'taxonomy_fingerprint': config['fingerprint'],
                               'platform': platform, 'video_key': key,
                               'video_id': row.get('video_id', row.get('id')), 'url': row.get('url', row.get('webpage_url')),
                               'primary_id': pid, 'secondary_id': sid, 'content_status': status,
+                              'content_node_id': nid, 'content_node_level': nodes[nid]['level'] if nid in nodes else None,
                               'leaf_id': lid, 'leaf_level': leaves[lid]['level'] if lid in leaves else None,
                               'tertiary_id': leaves[lid]['tertiary_id'] if lid in leaves else None,
                               'production_form_id': form, 'form_status': form_status,
                               'form_candidates': form_candidates, 'review_required': status != 'provided' or form_status != 'provided',
                               'duration_seconds': duration, 'duration_kind': duration_kind,
                               'eligibility': eligibility(row, secondary.get(sid)),
-                              'evidence_count': len(ev), 'accepted_votes': sum(l in leaves for l, _ in votes),
+                              'evidence_count': len(ev), 'accepted_votes': sum(n in nodes for n, _ in votes),
                               'title': row.get('title')}
                     out.write(json.dumps(result, ensure_ascii=False) + '\n')
                     stats['unique_rows'] += 1
-                    stats['unclassified_content'] += sid == UNKNOWN
+                    stats['unclassified_content'] += pid == UNKNOWN
                 seen.commit()
         seen.close()
     metadata = {'taxonomy_fingerprint': config['fingerprint'], 'run_fingerprint': digest(spec),
                 'min_score': args.min_score, 'min_margin': args.min_margin,
                 'stats': dict(stats), 'tasks': args.tasks.name if args.tasks else None,
                 'inputs': [p.name for p in args.input], 'completed': True,
+                'matching_mode': 'all_paths', 'evidence_source': args.evidence_source,
                 'lookup_only': args.lookup_only, 'semantic_boundary_status': 'metadata_candidates_require_review'}
     # Completion marker is committed last; aggregate refuses interrupted files.
     tmp.replace(args.output)
@@ -345,12 +363,14 @@ def aggregate(args):
     second = {s['id']: s for p in config['primary'] for s in p['secondaries']}
     parents = {s['id']: p['id'] for p in config['primary'] for s in p['secondaries']}
     forms = {f['id']: f for f in config['production_forms']}
-    leaves = {leaf['id']: dict(leaf, quota={}) for leaf in centers(config)}
+    nodes = {node['id']: dict(node, quota={}) for node in centers(config)}
+    leaves = {nid: node for nid, node in nodes.items() if node['is_leaf']}
     counts, seconds = Counter(), Counter()
     totals, effective = Counter(), Counter()
     duration_coverage, eligibility_counts = Counter(), Counter()
     input_records = 0
     common_run_fingerprint = None
+    common_policy = None
     with tempfile.TemporaryDirectory(prefix='aggregate-dedup-', dir=args.output.parent if args.output.parent.exists() else None) as temp:
         db = sqlite3.connect(str(Path(temp) / 'seen.sqlite'))
         db.execute('CREATE TABLE seen (key TEXT PRIMARY KEY) WITHOUT ROWID')
@@ -358,10 +378,17 @@ def aggregate(args):
             meta = json.loads(path.with_suffix(path.suffix + '.meta.json').read_text())
             if meta['taxonomy_fingerprint'] != config['fingerprint'] or not meta['completed']:
                 raise ValueError('Incomplete or incompatible classification output')
+            if meta.get('matching_mode') != 'all_paths':
+                raise ValueError('Expected scheme 3 classification output')
             if common_run_fingerprint is None:
                 common_run_fingerprint = meta['run_fingerprint']
             elif meta['run_fingerprint'] != common_run_fingerprint:
                 raise ValueError('Different center representations cannot be aggregated together')
+            policy = (meta['evidence_source'], meta['min_score'], meta['min_margin'])
+            if common_policy is None:
+                common_policy = policy
+            elif policy != common_policy:
+                raise ValueError('Different evidence sources or thresholds cannot be aggregated together')
             rows = 0
             with path.open() as stream:
                 for line in stream:
@@ -373,11 +400,21 @@ def aggregate(args):
                     if key is not None and db.execute('INSERT OR IGNORE INTO seen VALUES (?)', (key,)).rowcount == 0:
                         raise ValueError('Duplicate video across result files; classify inputs together')
                     pid, sid, fid = row['primary_id'], row['secondary_id'], row['production_form_id']
-                    if (pid == UNKNOWN) != (sid == UNKNOWN) or (sid != UNKNOWN and parents.get(sid) != pid) or fid not in {*forms, UNKNOWN}:
+                    if pid not in {*prim, UNKNOWN} or (sid != UNKNOWN and parents.get(sid) != pid) or fid not in {*forms, UNKNOWN}:
                         raise ValueError('Invalid content hierarchy/form')
+                    nid = row['content_node_id']
+                    node = nodes.get(nid)
+                    expected_pid = node['primary_id'] if node else UNKNOWN
+                    expected_sid = (node['secondary_id'] or UNKNOWN) if node else UNKNOWN
+                    if nid not in {*nodes, UNKNOWN} or (pid, sid) != (expected_pid, expected_sid):
+                        raise ValueError('Invalid content node hierarchy')
+                    if row['content_node_level'] != (node['level'] if node else None):
+                        raise ValueError('Invalid content node level')
                     lid = row['leaf_id']
-                    if lid != UNKNOWN and (lid not in leaves or leaves[lid]['secondary_id'] != sid or leaves[lid]['primary_id'] != pid):
+                    if lid != (nid if nid in leaves else UNKNOWN):
                         raise ValueError('Invalid leaf hierarchy')
+                    if row['leaf_level'] != (leaves[lid]['level'] if lid in leaves else None):
+                        raise ValueError('Invalid leaf level')
                     if row['tertiary_id'] != (leaves[lid]['tertiary_id'] if lid in leaves else None):
                         raise ValueError('Invalid tertiary ID')
                     platform = row['platform']
@@ -391,7 +428,7 @@ def aggregate(args):
                     if valid_duration:
                         effective[platform] += duration
                         duration_coverage[platform] += 1
-                    for dimension, cat in [('primary', pid), ('secondary', sid), ('leaf', lid), ('production_form', fid)]:
+                    for dimension, cat in [('primary', pid), ('secondary', sid), ('content_node', nid), ('leaf', lid), ('production_form', fid)]:
                         counts[(platform, dimension, cat)] += 1
                         if valid_duration:
                             seconds[(platform, dimension, cat)] += duration
@@ -402,7 +439,7 @@ def aggregate(args):
     rows = []
     for platform, total in totals.items():
         ready = args.accepted_only and duration_coverage[platform] == total and effective[platform] > 0
-        for dimension, categories in [('primary', prim), ('secondary', second), ('leaf', leaves), ('production_form', forms)]:
+        for dimension, categories in [('primary', prim), ('secondary', second), ('content_node', nodes), ('leaf', leaves), ('production_form', forms)]:
             classified = total - counts[(platform, dimension, UNKNOWN)]
             for cat in [*categories, UNKNOWN]:
                 key = (platform, dimension, cat)
@@ -412,8 +449,14 @@ def aggregate(args):
                 parent_count = counts[(platform, 'primary', parents[cat])] if dimension == 'secondary' and cat in parents else None
                 if dimension == 'leaf' and cat in leaves:
                     parent_count = counts[(platform, 'secondary', leaves[cat]['secondary_id'])] if leaves[cat]['level'] == 3 else counts[(platform, 'primary', leaves[cat]['primary_id'])]
+                node_parent = None
+                if dimension == 'content_node' and cat in nodes:
+                    node = nodes[cat]
+                    node_parent = node['secondary_id'] if node['level'] == 3 else (node['primary_id'] if node['level'] == 2 else None)
+                    parent_count = counts[(platform, 'secondary' if node['level'] == 3 else 'primary', node_parent)] if node_parent else None
                 rows.append({'platform': platform, 'dimension': dimension, 'id': cat, 'name': item['name'],
-                             'parent_id': parents.get(cat) if dimension == 'secondary' else (leaves[cat]['secondary_id'] if dimension == 'leaf' and cat in leaves and leaves[cat]['level'] == 3 else (leaves[cat]['primary_id'] if dimension == 'leaf' and cat in leaves else None)),
+                             'parent_id': node_parent if dimension == 'content_node' else (parents.get(cat) if dimension == 'secondary' else (leaves[cat]['secondary_id'] if dimension == 'leaf' and cat in leaves and leaves[cat]['level'] == 3 else (leaves[cat]['primary_id'] if dimension == 'leaf' and cat in leaves else None))),
+                             'node_level': nodes[cat]['level'] if dimension == 'content_node' and cat in nodes else None,
                              'leaf_level': leaves[cat]['level'] if dimension == 'leaf' and cat in leaves else None,
                              'video_count': count, 'share_all': count / total,
                              'share_classified': count / classified if cat != UNKNOWN and classified else None,
@@ -421,12 +464,16 @@ def aggregate(args):
                              'effective_duration_seconds': duration,
                              'share_effective_duration': share,
                              'quota': item['quota'],
-                             'quota_status': quota_status(share or 0, duration / 3600, item['quota'], ready) if cat != UNKNOWN and dimension != 'leaf' else 'not_applicable'})
-        for dimension in ['primary', 'secondary', 'leaf', 'production_form']:
+                             'quota_status': quota_status(share or 0, duration / 3600, item['quota'], ready) if cat != UNKNOWN and dimension not in {'leaf', 'content_node'} else 'not_applicable'})
+        for dimension in ['primary', 'secondary', 'content_node', 'leaf', 'production_form']:
             if sum(r['video_count'] for r in rows if r['platform'] == platform and r['dimension'] == dimension) != total:
                 raise ValueError('Category counts do not partition videos')
+        for pid in prim:
+            if counts[(platform, 'primary', pid)] != sum(counts[(platform, 'content_node', nid)] for nid, node in nodes.items() if node['primary_id'] == pid):
+                raise ValueError('L1 rollup disagrees with terminal assignments')
     atomic_json(args.output, {'taxonomy_version': config['taxonomy_version'], 'taxonomy_fingerprint': config['fingerprint'],
                 'input_records': input_records, 'included_videos': dict(totals),
+                'matching_mode': 'all_paths', 'evidence_source': common_policy[0] if common_policy else None,
                 'accepted_only': args.accepted_only, 'effective_duration_rows': dict(duration_coverage),
                 'effective_duration_totals': dict(effective),
                 'eligibility_counts': [{'platform': p, 'status': status, 'count': n} for (p, status), n in eligibility_counts.items()],
@@ -439,13 +486,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=os.environ.get('VIDEO_TAXONOMY_CONFIG'), help='External taxonomy JSON; no taxonomy data is bundled')
     sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('migrate-config', help='Migrate an external leaf-only config to scheme 3')
+    p.add_argument('--input', type=Path, required=True)
+    p.add_argument('--output', type=Path, required=True)
     for name in ['embed-centers', 'assign-tags', 'classify']:
         p = sub.add_parser(name)
         p.add_argument('--run-dir', type=Path, required=True)
         p.add_argument('--model', type=Path, default=Path(os.environ.get('VIDEO_MODEL_DIR', 'models/Qwen3-Embedding-0.6B')))
         p.add_argument('--device', default='cpu')
         p.add_argument('--batch-size', type=int, default=128)
-        p.add_argument('--min-score', type=float, default=0.0)
+        p.add_argument('--min-score', type=float, default=-1.0)
         p.add_argument('--min-margin', type=float, default=0.0)
         p.add_argument('--path-separator', choices=['slash', 'space'], default=None,
                        help='Center path joiner; defaults to the saved run or slash for a new run')
@@ -459,12 +509,19 @@ def main():
     p.add_argument('--platform', default='unspecified')
     p.add_argument('--tag-lookup', type=Path)
     p.add_argument('--lookup-only', action='store_true')
+    p.add_argument('--evidence-source', choices=['tags', 'metadata'], default='tags',
+                   help='Default: tags only; metadata also adds title and description as votes')
     p.add_argument('--output', type=Path, required=True)
     p = sub.add_parser('aggregate')
     p.add_argument('--input', type=Path, nargs='+', required=True)
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--accepted-only', action='store_true')
     args = parser.parse_args()
+    if args.command == 'migrate-config':
+        if args.output.exists():
+            parser.error('Configuration output exists; choose a new filename')
+        atomic_json(args.output, migrate_config(json.loads(args.input.read_text())))
+        return
     if not args.config:
         parser.error('Provide --config or VIDEO_TAXONOMY_CONFIG; no taxonomy data is bundled')
     if getattr(args, 'batch_size', 1) < 1:

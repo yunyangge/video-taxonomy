@@ -23,11 +23,13 @@ def useful(value):
     return True
 
 
-def evidence(row):
+def evidence(row, source='tags'):
     tags = row.get('tags') or []
     if isinstance(tags, str):
         tags = tags.split(',')
-    values = [row.get('title'), row.get('description')] + list(tags)
+    if source not in {'tags', 'metadata'}:
+        raise ValueError('Unknown evidence source')
+    values = ([row.get('title'), row.get('description')] if source == 'metadata' else []) + list(tags)
     # As in the previous vote pipeline, one repeated string is one vote.
     return list(dict.fromkeys(clean(x) for x in values if useful(x)))
 
@@ -92,6 +94,33 @@ def choose_leaf(votes, leaves):
         sums[lid] += score
     lid = min(counts, key=lambda x: (-counts[x], -sums[x], leaf_order[x]))
     return pid, sid, lid
+
+
+def choose_path(votes, nodes):
+    """Vote L1 first; direct ancestor votes may stop descent at L1 or L2."""
+    mapping = {node['id']: node for node in nodes}
+    order = {node['id']: i for i, node in enumerate(nodes)}
+    valid = [(nid, float(score)) for nid, score in votes
+             if nid in mapping and math.isfinite(float(score))]
+    if not valid:
+        return UNKNOWN, UNKNOWN, UNKNOWN
+
+    def winner(entries):
+        counts, sums = Counter(), Counter()
+        for nid, score in entries:
+            counts[nid] += 1
+            sums[nid] += score
+        return min(counts, key=lambda nid: (-counts[nid], -sums[nid], order[nid]))
+
+    pid = winner([(mapping[nid]['primary_id'], score) for nid, score in valid])
+    selected = [(nid, score) for nid, score in valid if mapping[nid]['primary_id'] == pid]
+    # The parent itself is a real endpoint; do not discard its votes or
+    # invent a child when those votes win against the child branches.
+    sid = winner([(mapping[nid]['secondary_id'] or pid, score) for nid, score in selected])
+    if sid == pid:
+        return pid, UNKNOWN, pid
+    nid = winner([(nid, score) for nid, score in selected if mapping[nid]['secondary_id'] == sid])
+    return pid, sid, nid
 
 
 # Only explicit metadata signals are used for form candidates. Broad words such

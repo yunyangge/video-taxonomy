@@ -11,8 +11,8 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from video_taxonomy.core import UNKNOWN, choose, choose_leaf, duration_seconds, eligibility, evidence, form_result, quota_status, video_key
-from video_taxonomy.taxonomy import centers, digest, load, validate
+from video_taxonomy.core import UNKNOWN, choose, choose_leaf, choose_path, duration_seconds, eligibility, evidence, form_result, quota_status, video_key
+from video_taxonomy.taxonomy import centers, digest, load, migrate_config, validate
 from fixtures import sample_config
 from video_taxonomy.pipeline import Matcher, TagLookup, run_config
 from argparse import Namespace
@@ -33,9 +33,37 @@ class Contracts(unittest.TestCase):
 
     def test_external_configuration(self):
         self.assertEqual(load(self.config_path), self.config)
-        self.assertEqual(len(centers(self.config)), 260)
-        self.assertTrue(all(s['id'] not in {x['id'] for x in centers(self.config)}
-                            for s in self.secondary.values() if s['children']))
+        rows = centers(self.config)
+        self.assertEqual(len(rows), 264)
+        self.assertEqual(sum(r['is_leaf'] for r in rows), 260)
+        self.assertEqual(len({r['id'] for r in rows}), 264)
+        self.assertEqual(len({r['text'] for r in rows}), 264)
+        self.assertEqual(rows[0]['path'], ['Example group A'])
+        self.assertEqual(rows[1]['path'], ['Example group A', 'Example S1'])
+        self.assertEqual(rows[3]['path'], ['Example group A', 'Example S2', 'Example leaf 0'])
+        self.assertTrue(all(s['id'] in {x['id'] for x in rows} for s in self.secondary.values()))
+
+    def test_legacy_config_migration_and_cache_invalidation(self):
+        old = json.loads(json.dumps(self.config))
+        old['matching_mode'] = 'leaf_only'
+        old.pop('fingerprint')
+        old['fingerprint'] = digest(old)
+        with self.assertRaisesRegex(ValueError, 'migrate-config'):
+            validate(old)
+        new = migrate_config(old)
+        self.assertEqual(new['matching_mode'], 'all_paths')
+        self.assertEqual(new['primary'], old['primary'])
+        self.assertNotEqual(new['fingerprint'], old['fingerprint'])
+        self.assertEqual(old['matching_mode'], 'leaf_only')
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)
+            source, target = path / 'old.json', path / 'new.json'
+            source.write_text(json.dumps(old))
+            args = [sys.executable, '-m', 'video_taxonomy', 'migrate-config', '--input', str(source), '--output', str(target)]
+            result = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(load(target), new)
+            self.assertNotEqual(subprocess.run(args, capture_output=True).returncode, 0)
 
     def test_only_separator_changes(self):
         a, b = centers(self.config), centers(self.config, ' ')
@@ -53,6 +81,12 @@ class Contracts(unittest.TestCase):
             self.assertEqual(run_config(args)[1], first)
             args.path_separator = 'slash'
             with self.assertRaises(ValueError):
+                run_config(args)
+            legacy_spec = {'taxonomy_fingerprint': self.config['fingerprint'],
+                           'embedding': self.config['embedding'],
+                           'centers': [r for r in centers(self.config) if r['is_leaf']]}
+            (Path(temp) / 'run.json').write_text(json.dumps(legacy_spec))
+            with self.assertRaisesRegex(ValueError, 'new directory'):
                 run_config(args)
 
     def test_corruption_and_quotas(self):
@@ -76,6 +110,8 @@ class Contracts(unittest.TestCase):
     def test_evidence_and_duration(self):
         self.assertEqual(evidence({'tags': ['example-a', 'example-a', '', '12345', '🔥'], 'title': 'example-a'}), ['example-a'])
         self.assertEqual(evidence({'tags': 'example-a,example-b'}), ['example-a', 'example-b'])
+        self.assertEqual(evidence({'title': 'example-title', 'description': 'example-description'}), [])
+        self.assertEqual(evidence({'title': 'example-title', 'tags': ['example-tag']}, 'metadata'), ['example-title', 'example-tag'])
         self.assertEqual(duration_seconds({'duration_seconds': 10}), (10, 'raw'))
         self.assertEqual(duration_seconds({'effective_duration_seconds': 10}), (10, 'effective'))
         self.assertEqual(duration_seconds({'effective_duration_seconds': float('nan')}), (None, 'invalid'))
@@ -91,6 +127,20 @@ class Contracts(unittest.TestCase):
         self.assertEqual(choose_leaf([('a1', .7), ('a2', .8), ('b1', .99), ('c', 1.)], leaves), ('P1', 'a', 'a2'))
         self.assertEqual(choose_leaf([('a2', .7), ('a1', .7)], leaves), ('P1', 'a', 'a1'))
         self.assertEqual(choose_leaf([], leaves), (UNKNOWN, UNKNOWN, UNKNOWN))
+
+    def test_all_path_vote_keeps_direct_endpoints(self):
+        nodes = centers(self.config)
+        self.assertEqual(choose_path([('P1', .9)], nodes), ('P1', UNKNOWN, 'P1'))
+        self.assertEqual(choose_path([('S2', .9)], nodes), ('P1', 'S2', 'S2'))
+        self.assertEqual(choose_path([('S1', .9)], nodes), ('P1', 'S1', 'S1'))
+        self.assertEqual(choose_path([('P1', .9), ('S2-000', .7)], nodes), ('P1', UNKNOWN, 'P1'))
+        self.assertEqual(choose_path([('P1', .5), ('S2-000', .7), ('S2-001', .8)], nodes), ('P1', 'S2', 'S2-001'))
+        self.assertEqual(choose_path([('S2', .9), ('S2-000', .7)], nodes), ('P1', 'S2', 'S2'))
+        self.assertEqual(choose_path([('S2-000', .1), ('S1', .2), ('P2', .99)], nodes)[0], 'P1')
+        # Configuration order, not lexical IDs, decides the final L1 tie.
+        reversed_nodes = [n for n in nodes if n['primary_id'] == 'P2'] + [n for n in nodes if n['primary_id'] == 'P1']
+        self.assertEqual(choose_path([('P1', .7), ('P2', .7)], reversed_nodes)[0], 'P2')
+        self.assertEqual(choose_path([('P1', float('nan')), ('missing', 1)], nodes), (UNKNOWN, UNKNOWN, UNKNOWN))
 
     def test_forms_are_separate_and_prioritized(self):
         forms = {f['name']: f['id'] for f in self.config['production_forms']}
@@ -116,14 +166,12 @@ class Contracts(unittest.TestCase):
 class EndToEnd(unittest.TestCase):
     def test_new_centers_cached_tags_stream_and_aggregate(self):
         config = sample_config()
-        spec = {'taxonomy_fingerprint': config['fingerprint'], 'embedding': config['embedding'], 'centers': centers(config)}
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             config_path = root / 'example.json'
             config_path.write_text(json.dumps(config))
             run = root / 'run'
-            run.mkdir()
-            (run / 'run.json').write_text(json.dumps(spec))
+            _, spec = run_config(Namespace(config=config_path, run_dir=run, path_separator=None), create=True)
             secondary_ids = [s['id'] for p in config['primary'] for s in p['secondaries']]
             leaf_ids = [leaf['id'] for leaf in spec['centers']]
             vectors = np.zeros((len(spec['centers']), 1024), np.float16)
@@ -134,15 +182,18 @@ class EndToEnd(unittest.TestCase):
             legacy = root / 'legacy'
             (legacy / 'vectors').mkdir(parents=True)
             (legacy / 'center_encoding.json').write_text(json.dumps({'dimensions': 1024, 'model': '/models/Qwen3-Embedding-0.6B'}))
-            tags = ['example-a', 'example-b', '杂音']
+            tags = ['example-a', 'example-b', '杂音', 'example-primary', 'example-branch', 'example-negative']
             target = [secondary_ids[0], secondary_ids[-1]]
             source = root / 'tags.parquet'
             pq.write_table(pa.table({'tag': tags}), source, row_group_size=2)
-            x = np.zeros((3, 1024), np.float16)
+            x = np.zeros((6, 1024), np.float16)
             x[0, leaf_ids.index(target[0])] = 1
             x[1, -1 + len(leaf_ids)] = 1
-            np.save(legacy / 'vectors/000000.npy', x[:2])
-            np.save(legacy / 'vectors/000001.npy', x[2:])
+            x[3, leaf_ids.index('P1')] = 1
+            x[4, leaf_ids.index('S2')] = 1
+            x[5, :len(leaf_ids)] = -1
+            for i in range(3):
+                np.save(legacy / 'vectors' / f'{i:06d}.npy', x[i*2:i*2+2])
 
             def invoke(*args, ok=True):
                 result = subprocess.run([sys.executable, '-m', 'video_taxonomy', '--config', str(config_path), *map(str, args)], capture_output=True, text=True)
@@ -153,7 +204,7 @@ class EndToEnd(unittest.TestCase):
                 return result
 
             invoke('assign-tags', '--run-dir', run, '--legacy-path-vectors', legacy, '--tag-source', source)
-            args = Namespace(run_dir=run, min_score=0., min_margin=0.)
+            args = Namespace(run_dir=run, min_score=-1., min_margin=0.)
             lookup = TagLookup(run / 'tag_lookup', args, config, spec)
             self.assertEqual(lookup.get(tags[0])[0], target[0])
             self.assertEqual(lookup.get(tags[1])[0], leaf_ids[-1])  # >255 label code
@@ -172,15 +223,18 @@ class EndToEnd(unittest.TestCase):
                 {'id': 'a', 'tags': [tags[1]], 'effective_duration_seconds': 50},
                 {'id': 'b', 'tags': [tags[1]], 'duration_seconds': 20, 'production_forms': ['动画与 CG', '游戏画面'], 'is_aigc': True},
                 {'id': 'c', 'title': '12345', 'tags': [tags[2]]},
-                {'id': 'd', 'tags': ['未收录']},
+                {'id': 'd', 'tags': ['未收录'], 'title': tags[0]},
                 {'id': 'e', 'tags': [tags[0]], 'content_secondary_id': target[0], 'production_form': '实拍记录', 'is_aigc': False, 'effective_duration_seconds': 3600},
+                {'id': 'f', 'tags': [tags[3], tags[3]]},
+                {'id': 'g', 'tags': [tags[4]]},
+                {'id': 'h', 'tags': [tags[5]]},
             ]
             source = root / 'videos.jsonl'
             source.write_text(''.join(json.dumps(r, ensure_ascii=False) + '\n' for r in rows))
             output = root / 'classified.jsonl'
             invoke('classify', '--run-dir', run, '--input', source, '--platform', 'test', '--tag-lookup', run / 'tag_lookup', '--lookup-only', '--output', output)
             result = [json.loads(l) for l in output.read_text().splitlines()]
-            self.assertEqual(len(result), 5)
+            self.assertEqual(len(result), 8)
             self.assertEqual(result[0]['secondary_id'], target[0])
             self.assertEqual(result[0]['evidence_count'], 1)
             self.assertEqual(result[0]['leaf_id'], target[0])
@@ -194,12 +248,29 @@ class EndToEnd(unittest.TestCase):
             self.assertEqual(result[1]['eligibility'], 'excluded_aigc')
             self.assertEqual(result[2]['secondary_id'], UNKNOWN)
             self.assertEqual(result[3]['secondary_id'], UNKNOWN)
+            self.assertEqual(result[5]['primary_id'], 'P1')
+            self.assertEqual(result[5]['secondary_id'], UNKNOWN)
+            self.assertEqual(result[5]['content_node_id'], 'P1')
+            self.assertEqual(result[5]['content_node_level'], 1)
+            self.assertEqual(result[5]['leaf_id'], UNKNOWN)
+            self.assertEqual(result[5]['content_status'], 'metadata_candidate')
+            self.assertEqual(result[6]['content_node_id'], 'S2')
+            self.assertEqual(result[6]['content_node_level'], 2)
+            self.assertEqual(result[6]['leaf_id'], UNKNOWN)
+            self.assertEqual(result[7]['primary_id'], 'P1')  # Negative cosine is still accepted by default.
+            output_metadata = json.loads(output.with_suffix('.jsonl.meta.json').read_text())
+            self.assertEqual(output_metadata['stats']['unclassified_content'], 2)
             summary = root / 'summary.json'
             invoke('aggregate', '--input', output, '--output', summary)
             report = json.loads(summary.read_text())
-            self.assertEqual(report['included_videos']['test'], 5)
-            for dim in ['primary', 'secondary', 'leaf', 'production_form']:
-                self.assertEqual(sum(r['video_count'] for r in report['rows'] if r['dimension'] == dim), 5)
+            self.assertEqual(report['included_videos']['test'], 8)
+            for dim in ['primary', 'secondary', 'content_node', 'leaf', 'production_form']:
+                self.assertEqual(sum(r['video_count'] for r in report['rows'] if r['dimension'] == dim), 8)
+            summary_rows = {(r['dimension'], r['id']): r for r in report['rows']}
+            self.assertEqual(summary_rows['primary', 'P1']['video_count'], 5)
+            self.assertEqual(summary_rows['content_node', 'P1']['video_count'], 2)
+            self.assertEqual(summary_rows['content_node', 'S2']['video_count'], 1)
+            self.assertEqual(summary_rows['primary', 'P1']['video_count'], sum(r['video_count'] for r in report['rows'] if r['dimension'] == 'content_node' and r['id'] in {'P1', 'S1', 'S2', *[f'S2-{i:03}' for i in range(257)]}))
             self.assertTrue(all(r['quota_status'] in {'not_evaluable', 'not_applicable'} for r in report['rows']))
             accepted = root / 'accepted.json'
             invoke('aggregate', '--input', output, '--accepted-only', '--output', accepted)
@@ -214,6 +285,21 @@ class EndToEnd(unittest.TestCase):
             mixed.with_suffix('.jsonl.meta.json').write_text(json.dumps(meta))
             error = invoke('aggregate', '--input', output, mixed, '--output', root / 'mixed.json', ok=False)
             self.assertIn('Different center representations', error.stderr)
+            mixed_meta = json.loads(output.with_suffix('.jsonl.meta.json').read_text())
+            mixed_meta['evidence_source'] = 'metadata'
+            mixed.with_suffix('.jsonl.meta.json').write_text(json.dumps(mixed_meta))
+            error = invoke('aggregate', '--input', output, mixed, '--output', root / 'mixed-policy.json', ok=False)
+            self.assertIn('Different evidence sources', error.stderr)
+            metadata_output = root / 'with-title.jsonl'
+            invoke('classify', '--run-dir', run, '--input', source, '--platform', 'test', '--tag-lookup', run / 'tag_lookup', '--lookup-only', '--evidence-source', 'metadata', '--output', metadata_output)
+            self.assertEqual(json.loads(metadata_output.read_text().splitlines()[3])['primary_id'], 'P1')
+            supplied_source = root / 'supplied.jsonl'
+            supplied_source.write_text(json.dumps({'id': 'supplied', 'content_node_id': 'P2'}) + '\n')
+            supplied_output = root / 'supplied-result.jsonl'
+            invoke('classify', '--run-dir', run, '--input', supplied_source, '--platform', 'test', '--tag-lookup', run / 'tag_lookup', '--lookup-only', '--output', supplied_output)
+            supplied = json.loads(supplied_output.read_text())
+            self.assertEqual((supplied['primary_id'], supplied['secondary_id'], supplied['leaf_id']), ('P2', UNKNOWN, UNKNOWN))
+            self.assertEqual(supplied['content_status'], 'provided')
             invoke('classify', '--run-dir', run, '--input', source, '--platform', 'test', '--tag-lookup', run / 'tag_lookup', '--lookup-only', '--output', output, ok=False)
             # Changed centers are rejected instead of accidentally using old caches.
             with (run / 'center_vectors.npy').open('ab') as f:

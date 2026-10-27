@@ -12,7 +12,7 @@ def sample_config():
     forms = [{'id': f'F{i:02}', 'name': name, 'definition': '', 'quota': dict(unlimited), 'quota_text': ''}
              for i, name in enumerate(FORM_PATTERNS, 1)]
     result = {'schema_version': 2, 'taxonomy_version': 'test-only',
-              'levels': ['primary', 'secondary', 'tertiary'], 'matching_mode': 'leaf_only',
+              'levels': ['primary', 'secondary', 'tertiary'], 'matching_mode': 'all_paths',
               'primary': [{'id': 'P1', 'name': 'Example group A', 'quota': dict(unlimited),
                            'secondaries': [secondary('S1'), secondary('S2', 257)]},
                           {'id': 'P2', 'name': 'Example group B', 'quota': dict(unlimited),

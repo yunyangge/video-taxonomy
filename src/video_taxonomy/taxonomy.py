@@ -1,4 +1,4 @@
-"""Compile the supplied taxonomy into a ragged tree with L2/L3 leaves."""
+"""Compile external taxonomies into all-path centers (scheme 3)."""
 import argparse
 import hashlib
 import json
@@ -80,8 +80,8 @@ def compile_markdown(path):
         'schema_version': 2, 'taxonomy_version': 'custom',
         'source': {'filename': Path(path).name, 'sha256': hashlib.sha256(raw).hexdigest()},
         'levels': ['primary', 'secondary', 'tertiary'],
-        'matching_mode': 'leaf_only',
-        'hint_semantics': '第三列按用户要求作为三级节点；有三级则仅匹配三级，否则匹配二级本身',
+        'matching_mode': 'all_paths',
+        'hint_semantics': '一级、一级到二级、一级到末端路径共同参与匹配；二级叶子只计一次',
         'rules': rules, 'primary': primary, 'production_forms': forms,
         'production_form_priority': priority, 'restrictions': restrictions,
         'unknown_id': 'unclassified',
@@ -95,7 +95,7 @@ def compile_markdown(path):
     return result
 
 
-def validate(config):
+def validate(config, allow_legacy=False):
     unhashed = {k: v for k, v in config.items() if k != 'fingerprint'}
     if config['fingerprint'] != digest(unhashed):
         raise ValueError('Taxonomy fingerprint mismatch')
@@ -104,8 +104,11 @@ def validate(config):
     if not ps or not ss or any(not p['secondaries'] for p in ps):
         raise ValueError('Taxonomy requires nonempty primary and secondary categories')
     children = [c for s in ss for c in s['children']]
-    if config.get('schema_version') != 2 or config.get('matching_mode') != 'leaf_only':
-        raise ValueError('Expected leaf-only schema; regenerate the taxonomy')
+    modes = {'all_paths', 'leaf_only'} if allow_legacy else {'all_paths'}
+    if config.get('schema_version') != 2 or config.get('matching_mode') not in modes:
+        raise ValueError('Expected matching_mode=all_paths (scheme 3); use migrate-config for a legacy config')
+    if config['embedding']['dimensions'] != 1024:
+        raise ValueError('Scheme 3 requires full 1024-dimensional embeddings')
     ids = [x['id'] for x in ps + ss + children + config['production_forms']]
     if len(ids) != len(set(ids)):
         raise ValueError('Duplicate category ID')
@@ -114,6 +117,9 @@ def validate(config):
     for p in ps:
         if len({s['name'] for s in p['secondaries']}) != len(p['secondaries']):
             raise ValueError(f'Duplicate secondary in {p["name"]}')
+        for s in p['secondaries']:
+            if len({c['name'] for c in s['children']}) != len(s['children']):
+                raise ValueError(f'Duplicate child in {s["name"]}')
     if set(config['production_form_priority']) != {f['id'] for f in config['production_forms']} or len(config['production_form_priority']) != len(config['production_forms']):
         raise ValueError('Invalid form priority')
 
@@ -128,20 +134,39 @@ def load(path=None):
 
 
 def centers(config, separator=' / '):
-    """One full-path vector for each leaf; ancestors never compete with children."""
+    """L1 + L1/L2 + L1/leaf; emit each node once in taxonomy order."""
     if separator not in (' / ', ' '):
         raise ValueError('Unsupported path separator')
     rows = []
     for p in config['primary']:
+        rows.append({'id': p['id'], 'name': p['name'], 'primary_id': p['id'],
+                     'secondary_id': None, 'tertiary_id': None, 'level': 1,
+                     'is_leaf': False, 'path': [p['name']], 'text': p['name']})
         for s in p['secondaries']:
-            for leaf in s['children'] or [s]:
-                path = [p['name'], s['name']] + ([leaf['name']] if s['children'] else [])
+            path = [p['name'], s['name']]
+            rows.append({'id': s['id'], 'name': s['name'],
+                         'primary_id': p['id'], 'secondary_id': s['id'],
+                         'tertiary_id': None, 'level': 2, 'is_leaf': not s['children'],
+                         'path': path, 'text': separator.join(path)})
+            for leaf in s['children']:
+                path = [p['name'], s['name'], leaf['name']]
                 rows.append({'id': leaf['id'], 'name': leaf['name'],
                              'primary_id': p['id'], 'secondary_id': s['id'],
-                             'tertiary_id': leaf['id'] if s['children'] else None,
-                             'level': 3 if s['children'] else 2, 'path': path,
+                             'tertiary_id': leaf['id'], 'level': 3, 'is_leaf': True, 'path': path,
                              'text': separator.join(path)})
     return rows
+
+
+def migrate_config(config):
+    """Change matching policy without importing or changing category definitions."""
+    validate(config, allow_legacy=True)
+    result = json.loads(json.dumps(config))
+    result['matching_mode'] = 'all_paths'
+    result['hint_semantics'] = '一级、一级到二级、一级到末端路径共同参与匹配；二级叶子只计一次'
+    result.pop('fingerprint', None)
+    result['fingerprint'] = digest(result)
+    validate(result)
+    return result
 
 
 if __name__ == '__main__':
